@@ -2,7 +2,7 @@
 
 **版本：6.0**
 
-本教程通过一系列由浅入深的完整示例，教你用 PyCircuit V6 设计数字电路：从一个计数器开始，逐步覆盖流水线、层次化组合、向量（SIMD）、测试台编写与完整的构建/仿真流程。
+本教程通过一系列由浅入深的完整示例，教你用 PyCircuit V6 设计数字电路：从一个计数器开始，逐步覆盖流水线、层次化组合、向量（SIMD）、解码器常用的类型级语法糖（位域 / 位掩码 / 枚举 / 受检转换）、测试台编写与完整的构建/仿真流程。
 
 **配套文档**：
 - 语言定义 → `docs/v6_PyCircuit_Specification.md`
@@ -21,9 +21,10 @@
 6. [标准模块模板与双模运行](#第-6-章标准模块模板与双模运行)
 7. [层次化组合：搭一个小 CPU](#第-7-章层次化组合搭一个小-cpu)
 8. [数据类型体系（`Data` / `Wire[DT]`）与向量 SIMD](#第-8-章数据类型体系data--wiredt-与向量-simd)
-9. [存储与 FIFO](#第-9-章存储与-fifo)
-10. [从 Python 到 Verilog：完整构建流程](#第-10-章从-python-到-verilog完整构建流程)
-11. [大型项目组织与调试](#第-11-章大型项目组织与调试)
+9. [解码器实战：位域、位掩码、枚举与受检转换](#第-9-章解码器实战位域位掩码枚举与受检转换)
+10. [存储与 FIFO](#第-10-章存储与-fifo)
+11. [从 Python 到 Verilog：完整构建流程](#第-11-章从-python-到-verilog完整构建流程)
+12. [大型项目组织与调试](#第-12-章大型项目组织与调试)
 
 ---
 
@@ -548,7 +549,223 @@ lane 之间逻辑**不同构**时（比如每个表项有独立的复杂状态�
 
 ---
 
-## 第 9 章：存储与 FIFO
+## 第 9 章：解码器实战：位域、位掩码、枚举与受检转换
+
+到目前为止，取指令的某几位靠 `instr[25:21]`，比较操作码靠手算掩码，状态机用裸整数常量。这些写法能跑，但把架构手册的信息**丢在了注释里**——编译器不知道 `[25:21]` 叫 `rd`，也不知道 `2` 是哪个枚举成员。
+
+本章介绍四组类型级语法糖，把这些信息写回代码。它们都是**纯前端语法糖**：展开为你本来就会手写的 `slice` / `cat` / `and-eq` / `assert`，MLIR 字节级等价，后端零改动。设计动机与 ARM ASL 数据类型的对照见 `docs/asl_alignment_todo.md`。
+
+### 9.1 位域视图：给位区间起名字
+
+用 `BitfieldSpec` 声明布局，范围写成 `(msb, lsb)` **闭区间**——和手册、和 Verilog 一致，不用在脑子里转半开区间：
+
+```python
+from pycircuit import BitfieldSpec
+
+INSTR = BitfieldSpec(width=32, fields={
+    "opcode": (6, 0),
+    "rd":     (11, 7),
+    "funct3": (14, 12),
+    "rs1":    (19, 15),
+    "rs2":    (24, 20),
+    "funct7": (31, 25),
+    "imm_i":  (31, 20),        # 与 funct7/rs2 重叠 —— 合法（同一份位的另一种视图）
+})
+```
+
+**字段允许重叠**，这正是解码器需要的：同一段位既是 `funct7 + rs2`，又是 I 型立即数 `imm_i`。
+
+对信号取视图后按名字读：
+
+```python
+instr = cas(domain, m.input("instr", width=32), cycle=0)
+f = INSTR.view(instr)            # 或简写 INSTR(instr)
+
+op  = f.opcode                   # ≡ instr[0:7]，属性形式
+rd  = f["rd"]                    # 下标形式，等价
+pair = f["funct7", "funct3"]     # 多字段拼接读（MSB-first，展开为 cat）
+```
+
+写字段用读-改-写 `update`，返回**新信号**（硬件里没有"原地修改"）：
+
+```python
+patched = INSTR.update(instr, rd=new_rd)     # ≡ cat(instr 高位, new_rd, instr 低位)
+```
+
+如果一个信号从声明起就有固定布局，可以在声明处直接绑定，省掉每次调 spec：
+
+```python
+csr = domain.signal(name="csr", width=32, fields={     # 传字典须给 width
+    "enable": (0, 0), "mode": (2, 1), "thresh": (15, 8),
+})
+csr <<= csr.update(mode=m.const(2, width=2))           # 算术 / <<= 照常工作
+m.output("mode", wire_of(csr.mode))                    # wire_of 自动解包
+```
+
+绑定后的信号（`BitfieldSignal`）是原信号的 **drop-in 替换**：算术、比较、`<<=`、位切片全部委托给底层信号，只是多了字段访问。`csr.raw` 能取回底层信号，`csr[3]` / `csr[0:8]` 仍是原始位切片（整数下标不与字段名冲突）。
+
+> 视图（`view`）只读；要写就用 `update`。单次 `update` 不能同时写两个重叠字段——那是歧义，会报错。
+
+### 9.2 位掩码匹配：与手册一字对照
+
+手册写 `funct7 = 0100000`，代码就写 `"0100000"`：
+
+```python
+is_reg_op = f.opcode.matches("0110011")      # ≡ (opcode & 0b1111111) == 0b0110011
+is_alu    = f.opcode.in_(["0110011", "0010011"])   # 任一命中
+not_mem   = f.opcode.not_in_(["0000011", "0100011"])
+```
+
+`x` / `-` 是忽略位，括号内的位也一律忽略（对应 ASL 的 `'1(0)x0'` 写法）：
+
+```python
+hit  = opcode.matches("1xx0011")     # 第 4、5 位不关心
+hit2 = opcode.matches("1(00)0011")   # 与上一行完全等价
+```
+
+模式位数必须**等于信号宽度**，写错会在展开期报错——这比默默比较错位要好得多。空格和 `_` 只是分隔符，可以拿来按字段分组：`"0100000 000"`。
+
+### 9.3 类型安全枚举：让操作码不再是裸整数
+
+ASL 式一行声明，宽度自动推导：
+
+```python
+from pycircuit import enumeration
+
+AluOp = enumeration("AluOp", "ADD SUB AND OR")     # 0-based 编码
+AluOp.width          # 2 == ceil(log2(4))
+```
+
+需要显式编码或文档字符串时用 class 形式：
+
+```python
+from pycircuit import PycEnum, auto
+
+class AluOp(PycEnum):
+    ADD = auto(); SUB = auto(); AND = auto(); OR = auto()
+```
+
+枚举可以直接当端口/寄存器的类型，宽度不用自己算：
+
+```python
+op    = m.input("alu_op", enum=AluOp)        # width 自动 = 2
+state = domain.signal(name="alu_op_q", enum=AluOp)
+
+state <<= AluOp.ADD                          # 寄存器加载成员编码
+m.output("is_sub", wire_of(state.is_(AluOp.SUB)))
+m.output("is_add", wire_of(op == AluOp.ADD))  # == 是 is_ 的别名
+```
+
+关键在于**防错**：下面三行都在展开期就报 `TypeError`，不会变成一个悄悄错掉的比较。
+
+```python
+Color = enumeration("Color", "RED GREEN BLUE")   # 另一个枚举类型
+
+op.is_(0)              # 裸 int → 枚举不与整数互转
+op == 2                # 同上
+op.is_(Color.RED)      # 跨枚举比较
+```
+
+要做位级运算（比如把枚举值塞进一个更宽的字段）就显式走 `.raw`；要造常量用 `AluOp.SUB.const(domain)`（传 `m` 得 `Wire`，传 `domain` 得 CAS）。
+
+### 9.4 受检转换：把「装得下」写成契约
+
+移位量只用低 5 位，高位"按理说"是零——`trunc(width=5)` 会默默砍掉，出错时无从察觉。`as_(width=)` 在截断前挂一条仿真断言：
+
+```python
+shamt = f.imm_i.as_(width=5, msg="shamt must fit in 5 bits")
+```
+
+综合路径下断言被丢弃，只剩 `trunc`——**零硬件代价的契约**。另外两种形式断言取值而不改数据路径：
+
+```python
+y = x.as_(2)                  # 断言 x == 2（值直接作位置参数）
+y = x.as_(0, 5, 10)           # 断言 x ∈ {0,5,10}
+y = x.as_(range=(2, 9))       # 断言 2 <= x <= 9（无符号）
+```
+
+三类约束**互斥**，一次一种；位置参数只表示取值断言，所以 `x.as_(2)` 绝不会被误解成"2 位宽"（宽度必须写 `width=2`）。等宽是 no-op，加宽会报错并提示改用 `zext` / `sext`。想把断言意图拼出来时用别名：`assert_fits(width=)` / `assert_range(lo, hi)` / `assert_in([...])`。
+
+### 9.5 缩放切片与显式签名比较
+
+已经打平成 packed 总线的数据，按元素取用 `lane`（对应 ASL 的 `x[i *: 8]`）：
+
+```python
+b1 = bus[1, 8]                 # 元组下标 (index, width)，最接近 ASL 写法
+b2 = bus.lane(2, width=8)      # 等价函数式写法；两者 ≡ bus[16:24]
+```
+
+越界、零宽、负索引都在展开期报错。多 lane 同构数据的首选仍然是第 8 章的 `Wire[Vector]`，`lane` 面向的是"总线已经是一根宽线"的残余场景。
+
+比较则是另一个容易踩的坑：`<` / `>` 的签名取决于操作数的 `signed` 标记。签名不能一眼看出来的地方，一律写显式方法：
+
+```python
+lt_u = a.ult(b);  gt_u = a.ugt(b);  le_u = a.ule(b);  ge_u = a.uge(b)
+lt_s = a.slt(b);  gt_s = a.sgt(b);  le_s = a.sle(b);  ge_s = a.sge(b)
+```
+
+八个方法在 `Wire` 和 CAS 上都齐备，分别落到 `pyc.ult` / `pyc.slt`。
+
+### 9.6 完整例子：一个小解码器
+
+把四组语法糖用在一起：
+
+```python
+from pycircuit import (
+    BitfieldSpec, CycleAwareCircuit, CycleAwareDomain,
+    cas, compile_cycle_aware, enumeration, mux, wire_of,
+)
+
+INSTR = BitfieldSpec(width=32, fields={
+    "opcode": (6, 0),  "rd":     (11, 7), "funct3": (14, 12),
+    "rs1":    (19, 15), "rs2":   (24, 20), "funct7": (31, 25),
+    "imm_i":  (31, 20),                    # 与 funct7/rs2 重叠
+})
+
+AluOp = enumeration("AluOp", "ADD SUB AND OR")
+
+
+def decoder(m: CycleAwareCircuit, domain: CycleAwareDomain, *, inputs=None) -> dict:
+    instr = cas(domain, m.input("instr", width=32), cycle=0)
+    f = INSTR.view(instr)
+
+    is_reg_op = f.opcode.matches("0110011")                  # OP
+    is_alu    = f.opcode.in_(["0110011", "0010011"])         # OP / OP-IMM
+    is_branch = f.opcode.matches("1100011")
+
+    is_sub = is_reg_op & f.funct7.matches("0100000") & f.funct3.matches("000")
+    is_add = is_alu & f.funct3.matches("000") & ~is_sub
+    is_and = is_alu & f.funct3.matches("111")
+
+    alu_op = mux(is_sub, AluOp.SUB.const(domain),
+                 mux(is_and, AluOp.AND.const(domain), AluOp.ADD.const(domain)))
+
+    state = domain.signal(name="alu_op_q", enum=AluOp)
+    state <<= AluOp.ADD
+    m.output("was_add", wire_of(state.is_(AluOp.ADD)))
+
+    shamt = f.imm_i.as_(width=5, msg="shamt must fit in 5 bits")
+
+    m.output("is_add",    wire_of(is_add))
+    m.output("is_and",    wire_of(is_and))
+    m.output("is_branch", wire_of(is_branch))
+    m.output("alu_op",    wire_of(alu_op))
+    m.output("rd",        wire_of(f.rd))
+    m.output("shamt",     wire_of(shamt))
+    return {}
+
+
+if __name__ == "__main__":
+    circ = compile_cycle_aware(decoder, eager=True, name="decoder")
+    with open("decoder.mlir", "w") as fh:
+        fh.write(circ.emit_mlir())
+```
+
+发射的 MLIR 里没有任何新 op——`f.rd` 是 `pyc.extract`（属性带上 `msb`，方便核对范围）、`matches` 是 `pyc.and` + `pyc.eq`、`is_` 是 `pyc.constant` + `pyc.eq`、`as_(width=)` 是 `extract + eq + pyc.assert + trunc`。也就是说：这一章买到的全是可读性和防错，**没有**多花一个门。
+
+---
+
+## 第 10 章：存储与 FIFO
 
 寄存器堆 / RAM / 队列不要用 `domain.signal()` 数组硬堆（会展开成海量 mux），用内建原语：
 
@@ -575,7 +792,7 @@ sync_bit = m.cdc_sync(dst_clk, dst_rst, src_bit, stages=2)
 
 ---
 
-## 第 10 章：从 Python 到 Verilog：完整构建流程
+## 第 11 章：从 Python 到 Verilog：完整构建流程
 
 以下命令均在仓库根目录执行，假设已按第 0 章设置好环境：
 
@@ -755,7 +972,7 @@ C++ 仿真器支持 VCD：测试运行目录下生成 `.vcd`，用 GTKWave / Sur
 
 ---
 
-## 第 11 章：大型项目组织与调试
+## 第 12 章：大型项目组织与调试
 
 ### 12.1 目录布局
 
@@ -804,6 +1021,7 @@ designs/my_soc/
 ## 下一步
 
 - 完整语言定义（`Data` 类型体系 / `Wire[DT]` / MLIR 映射的权威语义）：`docs/v6_PyCircuit_Specification.md`
+- 类型级语法糖的权威语义（位域 / 位掩码 / 枚举 / 受检转换 / 缩放切片）：`docs/v6_PyCircuit_Specification.md` §3.8–§3.11；与 ARM ASL 的逐项对照：`docs/asl_alignment_todo.md`、`docs/arm_data_type.md`
 - 3D 堆叠分层标注（`tier=` / `jump_tier`，Proposed）：`docs/v6_PyCircuit_Specification.md` §12 与 `docs/rfcs/tier_annotation.md`
 - 工具链内部（pyc 方言、pass 流水线、双发射器、sidecar 运行时）：`docs/v6_PyCircuit_Software_Architecture.md`
 - 仓库内可运行示例：`designs/examples/`（counter、calculator、fifo_loopback…）、`designs/BypassUnit`（向量实战）、`designs/IssueQueue`（向量 + 复杂状态）

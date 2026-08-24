@@ -1,6 +1,6 @@
-# pyCircuit (pyc4.0 / 0.40) agent instructions
+# pyCircuit (pyc6.0 / 0.60) agent instructions
 
-This repo follows the pyc4.0 (0.35 → 0.40) hard-break upgrade plan.
+This repo follows the pyc6.0 (0.40 → 0.60) hard-break upgrade plan.
 
 ## Read first (mandatory)
 

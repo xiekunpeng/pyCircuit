@@ -2,15 +2,16 @@
 
 **版本：6.0**
 
-**适用代码基线**：`pyCircuit` 主仓库 `main` 分支（含类型化 `Data` 信号体系、`Wire[Vector]` 、Sidecar 测试调度、层次化 MLIR 发射）。
+**适用代码基线**：`pyCircuit` 主仓库 `main` 分支（含类型化 `Data` 信号体系、`Wire[Vector]`、ASL 对齐的类型级语法糖、Sidecar 测试调度、层次化 MLIR 发射）。
 
 > **包名**：Python 包为 **`pycircuit`**（全小写）。不要使用 `pyCircuit` 作为 import 目标。
 >
 > **与 V5 的关系**：V6 完整继承 V5 的周期感知（Cycle-Aware）信号模型与层次化组合规范，并将以下能力纳入正式语言规范：
 > 1. **类型化数据体系**（`Data` 层级：`Bits` / `Vector` / `Clock` / `Reset`，由 `Wire[DT]` 统一承载；逐 lane 运算、降维归约、广播）
-> 2. **Sidecar 测试调度**（测试激励与检查外置为二进制容器）
-> 3. **双编译路径**（`compile_cycle_aware` eager/JIT 与 `@module` JIT）
-> 4. **存储 / FIFO / CDC 原语**
+> 2. **类型级语法糖**（位域视图、位掩码模式匹配、类型安全枚举、受检转换、缩放切片、显式签名比较——与 ARM ASL 数据类型对齐，见 §3.8–§3.11）
+> 3. **Sidecar 测试调度**（测试激励与检查外置为二进制容器）
+> 4. **双编译路径**（`compile_cycle_aware` eager/JIT 与 `@module` JIT）
+> 5. **存储 / FIFO / CDC 原语**
 
 ---
 
@@ -19,6 +20,10 @@
 1. [概述与设计哲学](#1-概述与设计哲学)
 2. [信号类型纪律（Non-Negotiable）](#2-信号类型纪律non-negotiable)
 3. [核心类型与数据类型体系](#3-核心类型与数据类型体系)
+   - 3.8 [位域视图（`BitfieldSpec`）](#38-位域视图bitfieldspec)
+   - 3.9 [位掩码模式匹配（`matches` / `in_`）](#39-位掩码模式匹配matches--in_)
+   - 3.10 [类型安全枚举（`PycEnum`）](#310-类型安全枚举pycenum)
+   - 3.11 [受检转换、缩放切片与显式签名比较](#311-受检转换缩放切片与显式签名比较)
 4. [Forward Signal 与寄存器推导](#4-forward-signal-与寄存器推导)
 5. [全局函数](#5-全局函数)
 6. [周期管理与自动周期平衡](#6-周期管理与自动周期平衡)
@@ -62,6 +67,11 @@ from pycircuit import (
     Tb, CycleAwareTb, testbench,
     # ── 位操作辅助 ──
     cat, zext, sext, trunc,
+    # ── 类型级语法糖（§3.8–§3.11）──
+    BitfieldSpec,          # 位域布局（view / update / bind）
+    BitfieldSignal,        # 绑定了位域布局的信号
+    PycEnum, auto,         # 类型安全枚举（class 形式）
+    enumeration,           # 类型安全枚举（ASL 式一行声明）
 )
 ```
 
@@ -171,10 +181,15 @@ low = data[0:8];  bit5 = data[5]            # 切片 / 索引（向量：取 lan
 | 方法 | 说明 |
 |------|------|
 | `select(t, f)` | 条件选择（等价 `mux(self, t, f)`） |
-| `trunc(w)` / `zext(w)` / `sext(w)` | 宽度变换 |
-| `slice(high, low)` | 位片段 |
+| `trunc(width=)` / `zext(width=)` / `sext(width=)` | 宽度变换 |
+| `slice(*, lsb, width)` | 位片段（等价 `x[lsb : lsb+width]`） |
+| `lane(idx, *, width)` / `x[idx, width]` | 缩放切片（按元素取，见 §3.11） |
 | `named(name)` | 调试名称 |
 | `as_signed()` / `as_unsigned()` | 符号标记（影响比较与右移语义） |
+| `ult / ugt / ule / uge` | 显式无符号比较 |
+| `slt / sgt / sle / sge` | 显式有符号比较（见 §3.11 的显式签名约定） |
+| `matches / in_ / not_in_` | 位掩码模式匹配（见 §3.9） |
+| `as_ / assert_fits / assert_range / assert_in` | 受检转换（见 §3.11） |
 
 > `Wire` **禁止**作为 Python `bool` 使用（`if sig:` 报错）——硬件条件必须用 `mux` / `select` 表达。
 
@@ -218,7 +233,7 @@ m = CycleAwareCircuit("my_circuit")
 | 方法 | 说明 |
 |------|------|
 | `create_domain(name, *, frequency_desc="", reset_active_high=False)` | 创建 `CycleAwareDomain` |
-| `input(name, *, width, signed=False, shape=None)` | 输入端口。`shape=None` 返回标量 `Wire[Bits]`；`shape=[N]` / `shape=[N,M]` 返回 `Wire[Vector[...]]`（需 `cas()` 包装后参与运算） |
+| `input(name, *, width, signed=False, shape=None, fields=None, enum=None)` | 输入端口。`shape=None` 返回标量 `Wire[Bits]`；`shape=[N]` / `shape=[N,M]` 返回 `Wire[Vector[...]]`（需 `cas()` 包装后参与运算）。`fields=` 返回 `BitfieldSignal`（§3.8），`enum=` 返回 `EnumSignal`（§3.10）；三者互斥 |
 | `output(name, value)` | 注册输出端口（标量传 `wire_of(sig)`；向量 `Wire` 可直接传） |
 | `const(value, *, width)` | 常量 `Wire`（用 `cas()` 包装后参与 CAS 表达式） |
 | `vec(*elems)` / `cat(parts)` | 从已有元素构造 `Wire[Vector]`（可变参数） / 位拼接 |
@@ -234,7 +249,7 @@ domain = m.create_domain("clk")
 
 | 方法 | 说明 |
 |------|------|
-| `signal(*, width, reset_value=0, name="", shape=None)` | **前向声明寄存器**——创建状态的唯一方式。`shape=` 时创建向量状态；返回 `ForwardSignal` |
+| `signal(*, width, reset_value=0, name="", shape=None, fields=None, enum=None)` | **前向声明寄存器**——创建状态的唯一方式。`shape=` 时创建向量状态；返回 `ForwardSignal`。`fields=` 返回 `BitfieldSignal`（§3.8），`enum=` 返回 `EnumSignal`（§3.10）；三者互斥 |
 | `cycle(sig, reset_value=None, name="")` | 对信号插入单级 DFF，返回延后一拍的 CAS |
 | `next()` / `prev()` | 推进 / 回退当前逻辑周期 |
 | `push()` / `pop()` | 周期计数器压栈 / 出栈（必须配对） |
@@ -254,7 +269,7 @@ rtc_clk = m.create_domain("RTC_CLK", frequency_desc="1Hz")
 
 跨时钟域信号**必须**经显式 CDC 原语（`cdc_sync` / `async_fifo`）传递；后端 `pyc-check-clock-domains` 检查违例并报错。
 
-### 3.3 CycleAwareSignal
+### 3.6 CycleAwareSignal
 
 唯一的标量信号类型。包含底层线网（内部管理）、`cycle`、`domain`。
 
@@ -277,13 +292,19 @@ low = data[0:8];  bit5 = data[5]            # 切片 / 索引
 |------|------|
 | `select(t, f)` | 条件选择（等价 `mux(self, t, f)`） |
 | `trunc(w)` / `zext(w)` / `sext(w)` | 宽度变换 |
-| `slice(high, low)` | 位片段 |
+| `slice(high, low)` / `slice(*, lsb, width)` | 位片段（两种等价写法，闭区间 / 起点+宽度） |
+| `lane(idx, *, width)` / `x[idx, width]` | 缩放切片（见 §3.11） |
 | `named(name)` | 调试名称 |
 | `as_signed()` / `as_unsigned()` | 符号标记（影响比较与右移语义） |
+| `ult / ugt / ule / uge`、`slt / sgt / sle / sge` | 显式签名比较（全套，见 §3.11） |
+| `matches / in_ / not_in_` | 位掩码模式匹配（见 §3.9） |
+| `as_ / assert_fits / assert_range / assert_in` | 受检转换（见 §3.11） |
 
 > CAS **禁止**作为 Python `bool` 使用（`if sig:` 报错）——硬件条件必须用 `mux` / `select` 表达。
+>
+> 上述 §3.8–§3.11 的语法糖在 `Wire` 与 CAS 上**语义一致**；CAS 版本保留 `cycle` 标签。
 
-### 3.4 ForwardSignal
+### 3.7 ForwardSignal
 
 `domain.signal()` 的返回类型。读侧行为与 CAS 完全一致；额外提供写侧接口：
 
@@ -291,6 +312,194 @@ low = data[0:8];  bit5 = data[5]            # 切片 / 索引
 sig <<= expr                     # 无条件赋值（连接 D 端）
 sig.assign(expr, when=cond)      # 条件赋值（寄存器使能）
 ```
+
+### 3.8 位域视图（`BitfieldSpec`）
+
+给**单个信号**的位区间起名字，取代解码/系统寄存器代码里的 `instr[25:21]` 魔法数字。字段范围写成 `(msb, lsb)` **闭区间**（与架构手册、Verilog 一致），**允许字段重叠**——同一寄存器的多种视图是合法的。
+
+```python
+from pycircuit import BitfieldSpec
+
+INSTR = BitfieldSpec(width=32, fields={
+    "opcode": (31, 26), "rd": (25, 21), "rs": (20, 16), "imm16": (15, 0),
+    "imm26":  (25, 0),                 # 与 rd/rs/imm16 重叠 —— 合法（不同视图）
+})
+```
+
+**用法 A：临时视图**（对已有信号即用即取，不改变原信号）
+
+```python
+f  = INSTR.view(instr)                 # 或简写 INSTR(instr)
+op = f["opcode"]                       # ≡ instr[26:32]
+op = f.opcode                          # 属性形式，等价
+hi = f["opcode", "rd"]                 # 多字段拼接读（MSB-first）≡ cat(...)
+wr = INSTR.update(instr, rd=new_rd)    # 读-改-写 ≡ cat(instr[26:32], new_rd, instr[0:21])
+```
+
+**用法 B：声明即绑定**（声明处指示布局，之后直接按名访问）
+
+```python
+instr = m.input("instr", width=32, fields={          # 传字典须给 width
+    "opcode": (31, 26), "rd": (25, 21), "imm16": (15, 0),
+})
+instr = m.input("instr", fields=INSTR)               # 传 spec 则 width 可省略
+
+op   = instr["opcode"]                 # 下标形式
+rd   = instr.rd                        # 属性形式
+pair = instr["opcode", "rd"]           # 多字段拼接读
+
+cnt = domain.signal(name="cnt", width=32, fields={"opcode": (31, 26), "rd": (25, 21)})
+cnt <<= cnt + 1                        # 算术 / <<= 委托给底层信号
+nxt = cnt.update(rd=new_rd)            # 读-改-写，结果仍是绑定信号
+m.output("rd", wire_of(cnt.rd))        # wire_of / m.output 自动解包
+```
+
+`BitfieldSpec.bind(sig)`（即 `fields=` 背后的机制）返回 **`BitfieldSignal`**：它把算术、比较、`<<=`、位切片全部委托给底层信号（drop-in 替换），只额外增加字段访问。`x.raw` 取回底层信号，`x.spec` 取回布局。
+
+**访问语义速查**
+
+| 写法 | 含义 |
+|------|------|
+| `x["opcode"]` / `x.opcode` | 字段读（字符串下标 / 属性） |
+| `x["opcode", "rd"]` | 多字段拼接读（MSB-first，展开为 `cat`） |
+| `x[3]` / `x[0:8]` | 原始位切片（整数 / `slice` 下标，Python 半开区间） |
+| `x.update(rd=v)` | 读-改-写，返回新的绑定信号 |
+| `x.raw` / `x.spec` | 底层信号 / 布局 |
+
+规则：`BitfieldView` **只读**（写用 `spec.update()`）；单次 `update` 不得写重叠字段（歧义，报错）；字段值可为 `int`（带值域检查）/ `Wire` / CAS，宽度不符报错；字段名与包装成员冲突（如 `update`/`raw`/`width`/`spec`）时用字符串下标访问。
+
+> **纯前端语法糖**：字段读展开为 `pyc.extract`，`update` 展开为 `pyc.concat`，与手写 slice/cat 的 MLIR **字节级等价**。不改方言语义。
+
+### 3.9 位掩码模式匹配（`matches` / `in_`）
+
+把指令编码表写成与架构手册一字对照的形式，展开为 `(sig & mask) == value`。
+
+```python
+hit  = opcode.matches("1xx0")               # ≡ (opcode & 0b1001) == 0b1000
+hit2 = opcode.matches("1(0)x0")             # 括号内位也忽略，与 "1xx0" 等价
+sel  = opcode.in_(["000x", "0010", "11xx"]) # 任一命中（or 归约）
+miss = opcode.not_in_(["1xx0", "0011"])     # ASL IN !{...}
+
+is_add = instr["opcode"].matches("100000")  # 与 §3.8 位域视图配合
+```
+
+**模式语法**（MSB-first）：
+
+| 字符 | 含义 |
+|------|------|
+| `0` / `1` | 关心位（必须相等） |
+| `x` / `X` / `-` | 忽略位 |
+| `(...)` | 括号内每一位都是忽略位（无论写 0 还是 1），对应 ASL `'1(0)x0'` |
+| 空格 / `_` | 分隔符，仅为可读性，不占位宽 |
+
+模式位数必须**等于信号宽度**，否则展开期报错；`in_` / `not_in_` 接受变长参数或单个可迭代对象，空集合报错。结果一律是 i1。
+
+### 3.10 类型安全枚举（`PycEnum`）
+
+枚举是**命名类型**，不与裸整数互转——防「拼错成员 / 宽度不够 / 跨枚举比较」。
+
+```python
+from pycircuit import PycEnum, auto, enumeration
+
+# 写法① ASL 式一行声明（只列名字）
+SRType = enumeration("SRType", "LSL LSR ASR ROR")     # 也可传列表或多个参数
+
+# 写法② class 形式（需要显式编码 / 文档字符串时用）
+class SRType(PycEnum):
+    LSL = auto(); LSR = auto(); ASR = auto(); ROR = auto()
+
+SRType.width        # 2 == ceil(log2(4))，由成员数自动推导
+SRType.ASR.value    # 2（成员编码；基于 enum.Enum 而非 IntEnum，不隐式转 int）
+```
+
+声明即绑定，返回 **`EnumSignal`**：
+
+```python
+op  = m.input("op", enum=SRType)        # width 自动 = SRType.width
+hit = op.is_(SRType.LSL)                # ≡ (raw == 0)，返回 i1
+m.output("is_ror", op == SRType.ROR)    # == 是 is_ 的别名
+
+st = domain.signal(name="state", enum=SRType)
+st <<= SRType.LSR                       # 枚举寄存器加载成员编码
+
+tagged = SRType.bind(existing_sig)      # 给已有信号贴枚举类型
+c      = SRType.ROR.const(m)            # 定宽常量（domain 参数则返回 CAS）
+raw    = op.raw                         # 取回底层信号（位级运算走 .raw）
+```
+
+**类型安全边界**（以下均在展开期 `TypeError`）：
+
+```python
+Color = enumeration("Color", "RED GREEN BLUE")   # 另一个枚举类型
+
+op.is_(0)            # 裸 int → 报错（枚举不与整数互转）
+op == 2              # 同上
+op.is_(Color.RED)    # 跨枚举 → 报错
+```
+
+`EnumSignal` 刻意只暴露 `is_` / `is_not` / `==` / `!=`（仅接受同枚举成员）与 `.raw`；显式 `width=` 与 `E.width` 不一致时报错，且 `enum=` 不可与 `fields=` / `shape=` 混用。
+
+### 3.11 受检转换、缩放切片与显式签名比较
+
+**受检转换 `as_`**（对应 ASL `expression as ty`）——把「我确信它装得下 / 取值受限」的设计意图变成可仿真验证的契约。三类约束**互斥**，一次一种：
+
+```python
+# ① 取值集合（值直接作为位置参数，最省字）
+y = x.as_(2)                     # 断言 x == 2，原样返回 x
+y = x.as_(0, 5, 10)              # 断言 x ∈ {0,5,10}；也可 as_([0,5,10]) / as_(values=[...])
+y = x.assert_in([0, 5, 10])      # 具名方法
+
+# ② 值区间
+y = x.as_(range=(2, 9))          # 断言 2 <= x <= 9（无符号），原样返回
+y = x.assert_range(2, 9)         # 具名方法
+
+# ③ 宽度收窄
+y = x.as_(width=4)               # 断言高位为 0，再 trunc 到 i4
+y = x.assert_fits(width=4)       # 等价别名
+y = x.as_(width=4, msg="opcode 必须 4 位")
+```
+
+宽度收窄发射的 MLIR（i8 → i4）：
+
+```mlir
+%hi = pyc.extract %x {lsb = 4, msb = 7} : i8 -> i4
+%ok = pyc.eq %hi, 0 -> i1
+pyc.assert %ok {msg = "as_: value does not fit in 4 bits"}
+%y  = pyc.trunc %x : i8 -> i4        // ← 综合路径只保留这一步
+```
+
+| 规则 | 说明 |
+|------|------|
+| 位置参数只归取值断言 | `x.as_(2)` 明确表示「断言 == 2」，不会被当成 2 位宽；`width=` / `range=` 必须用关键字 |
+| 断言可丢弃 | `pyc.assert` 是仿真期副作用，综合时丢掉即退化为纯 `trunc`（零硬件代价契约） |
+| 取值 / 区间断言不改数据路径 | 只挂契约，宽度与值原样返回 |
+| 等宽 / 加宽 | `as_(width=x.width)` 是 no-op；加宽报错（改用 `zext` / `sext`） |
+| 平凡边界省略 | `range=` 的边界若被宽度天然满足则不发对应比较，全覆盖时不发断言 |
+| 有符号收窄 | 当前只断言无符号意义的「高位全零」，有符号收窄请显式配合 `as_signed()` |
+
+与静默 `trunc()` 的区别：`trunc` 悄悄砍高位，`as_` 留下一条可仿真验证的契约。
+
+**缩放切片 `lane`**（对应 ASL `x[idx *: len]`）——按元素粒度索引扁平总线：
+
+```python
+lane = bus[i, 8]                 # 下标糖（元组 (index, width)），最接近 ASL x[i *: 8]
+lane = bus.lane(i, width=8)      # 等价函数式写法
+                                 # 两者 ≡ bus[i*8 : (i+1)*8]；lane i 占 bit [i*8, i*8+7]
+```
+
+`i` / `width` 为展开期 Python `int`；`width <= 0`、`i < 0`、越界（`i*width+width > 信号宽度`）均在展开期报错。元组下标 `x[i, w]` 与位切片 `x[a:b]`、位域多字段读 `x["a","b"]` 无歧义（下标类型不同）。
+
+> ASL 的 `*:` 在 Python 中是语法错误，故用元组下标编码。多 lane 同构数据的首选仍是 `Wire[Vector]`（§3.3）；`lane` 面向已被打平成 packed 总线的残余场景。
+
+**显式签名比较**——`<` / `>` 的签名取决于操作数的 `signed` 标记，容易误判。签名不能从上下文一眼看出的比较，一律用显式方法：
+
+| 无符号 | 有符号 |
+|--------|--------|
+| `ult` / `ugt` / `ule` / `uge` | `slt` / `sgt` / `sle` / `sge` |
+
+`Wire` 与 CAS 都提供全套八个方法，结果为 i1，分别落到 `pyc.ult` / `pyc.slt`。
+
+**编程约定速记**：**比较显式签名、截断显式宽度、常量集中分层**。前两条分别由本节的显式比较与 `as_(width=)` 落实；第三条指架构常量按意图分层（派生量 vs 参数量）集中一处定义。
 
 ---
 
@@ -500,7 +709,7 @@ circ = compile_cycle_aware(top, eager=True, name="top", hierarchical=True)
 
 ## 9. 仿真与测试（Tb / CycleAwareTb / Sidecar）
 
-### 11.1 Tb（周期编号模型）
+### 9.1 Tb（周期编号模型）
 
 ```python
 from pycircuit import Tb, testbench
@@ -519,7 +728,7 @@ def tb(t: Tb) -> None:
 - `phase="post"`（默认）：提交后观测（XFER-OBS）
 - 其余 API：`print` / `print_every` / `sva_assert` / `random`
 
-### 11.2 CycleAwareTb（隐式周期推进）
+### 9.2 CycleAwareTb（隐式周期推进）
 
 将 `at=cycle` 替换为与设计对称的 `tb.next()`：
 
@@ -554,7 +763,7 @@ def tb(t: Tb) -> None:
 | `finish(*, at=None)` / `print(...)` / `timeout(n)` | 结束 / 打印 / 超时 |
 | `clock` / `reset` / `sva_assert` / `random` | 透传 `Tb` |
 
-### 11.3 测试调度：inline vs sidecar
+### 9.3 测试调度：inline vs sidecar
 
 测试事件（drive/expect）有两种下发方式（`pycircuit build --tb-schedule-mode {inline,sidecar}`）：
 
@@ -576,7 +785,7 @@ pycircuit sidecar verify  out/tb.sidecar        # 校验结构
 
 ## 10. 编译入口
 
-### 12.1 compile_cycle_aware()（V6 主路径）
+### 10.1 compile_cycle_aware()（V6 主路径）
 
 ```python
 def compile_cycle_aware(
@@ -599,7 +808,7 @@ mlir_text = circ.emit_mlir()
 - `eager=False`（JIT）：AST 解析 fn，不执行；支持把 Python `if`（i1 条件）编译为 `scf.if` → mux，`for`（静态可迭代）展开。有原型级限制。
 - `hierarchical=True`：见 §7.6。
 
-### 12.2 @module JIT 路径（V4 风格，仍受支持）
+### 10.2 @module JIT 路径（V4 风格，仍受支持）
 
 ```python
 from pycircuit import module, compile, Circuit
@@ -612,7 +821,7 @@ design = compile(build)
 
 `@module` 边界产生 `pyc.instance`；`@function` 内联；`@const` 为编译期纯元编程（禁发 IR）。`pycircuit emit` / `pycircuit build` CLI 走此入口。
 
-### 12.3 CLI
+### 10.3 CLI
 
 ```bash
 # 生成 MLIR
@@ -653,7 +862,7 @@ pycircuit sidecar verify FILE
 | `mux / select` | `pyc.mux` |
 | `== < （按符号）` | `pyc.eq / ult / slt` |
 | `trunc / zext / sext` | `pyc.trunc / zext / sext` |
-| `[lo:hi]`（标量） | `pyc.extract`（attr `lsb`） |
+| `[lo:hi]`（标量）、`lane(i, width=)`、`x[i, w]` | `pyc.extract`（attrs `lsb`、可选 `msb`） |
 | `<< >>`（常量位移） | `pyc.shli / lshri / ashri` |
 | `<< >>`（动态位移） | `pyc.shl / lshr / ashr` |
 | `cat(...)` | `pyc.concat`（MSB-first） |
@@ -680,6 +889,23 @@ pycircuit sidecar verify FILE
 | `broadcast(dim=)` | `pyc.v_broadcast_dim` |
 | `reduce_or / reduce_and / reduce_sum` | `pyc.v_or_reduce / v_and_reduce / v_add_reduce`（attrs `dim`, `mode`） |
 
+### 类型级语法糖（§3.8–§3.11）
+
+这些特性**不引入新 op**，全部在展开期降解到既有 op——与手写等价代码的 MLIR 字节级一致：
+
+| 前端 | 降解为 |
+|------|--------|
+| `spec.view(x)["fld"]` / `x.fld` / `x[i, w]` / `lane()` | `pyc.extract`（attrs `lsb`、可选 `msb`） |
+| `spec.update(x, fld=v)` / `x["a","b"]` | `pyc.concat`（MSB-first）+ `pyc.extract` |
+| `x.matches(p)` | `pyc.and` + `pyc.eq`（`(x & mask) == value`） |
+| `x.in_(...)` / `x.not_in_(...)` | 各 `matches` 的 `pyc.or` 归约（`not_in_` 再取 `pyc.not`） |
+| `E.MEMBER.const(m)` / `x.is_(E.M)` | `pyc.constant` + `pyc.eq` |
+| `x.as_(width=w)` | `pyc.extract` + `pyc.eq` + `pyc.assert` + `pyc.trunc` |
+| `x.as_(range=)` / `x.as_(values)` | `pyc.ult` / `pyc.eq` 组合 + `pyc.assert`（数据路径不变） |
+| `sgt / sle / sge` | `pyc.slt`（+ `pyc.not`） |
+
+`pyc.extract` 的 `msb` 是**可选**属性；存在时 verifier 强制 `msb == lsb + result_width - 1`，仅为阅读 MLIR 时一眼看出提取范围，旧 IR（无 `msb`）仍合法。`pyc.assert` 在 Verilog 侧包在 `` `ifndef SYNTHESIS`` 中，综合可丢弃。
+
 测试台不产生硬件 op：`@testbench` 程序序列化为模块属性 `pyc.tb.payload`（inline 模式）或外置 sidecar 容器。
 
 ---
@@ -692,7 +918,7 @@ pycircuit sidecar verify FILE
 
 **术语纪律:分层维度一律用 tier(裸片层),不用 layer**(后者指金属布线层)。
 
-### 14.1 与 `.cycle` 的语义对照(理解本扩展的钥匙)
+### 12.1 与 `.cycle` 的语义对照(理解本扩展的钥匙)
 
 | | `.cycle` | `.tier` |
 |---|---|---|
@@ -702,7 +928,7 @@ pycircuit sidecar verify FILE
 
 两套传播机制共存于同一次 elaboration,互不干扰。
 
-### 14.2 语法
+### 12.2 语法
 
 ```python
 a  = cas(domain, m.input("a", width=8), tier=0)          # 定义处显式
@@ -715,7 +941,7 @@ tmp = cas(domain, m.input("c", width=8))                  # 未指派:tier=None,
 outs = domain.call(alu, inputs={...}, tier=1)             # 模块级缺省 tier
 ```
 
-### 14.3 语义规则
+### 12.3 语义规则
 
 1. **传播:** 运算结果的 tier 由输入继承(全部/多数同层继承之;混层取主导方向),强度记为推断;
 2. **反馈信号:** `domain.signal()` 的 tier 在声明处确定,`<<=` 赋值不改变它;跨层反馈须用 `jump_tier` 显式表达;
@@ -723,11 +949,13 @@ outs = domain.call(alu, inputs={...}, tier=1)             # 模块级缺省 tier
 4. **`jump_tier(expr, to=k)`:** 返回新 CAS,`.tier == k`、`.cycle` 不变、零硬件效应;`to` 须为编译期常量;
 5. **强度三态与 EDA 契约:** free(未指派,分割器全权)/ hint(显式与推断,可改写但必须输出结构化 diff)/ locked(必须服从,不可满足报错)。分割器结果写入以稳定 ID 为键的 sidecar tier 表,不回写源码。
 
-### 14.4 IR 与发射
+### 12.4 IR 与发射
 
 - MLIR 可选属性:`pyc.tier`(int)、`pyc.tier_strength`(`"hint"|"locked"`)、模块级 `pyc.tier_default`;无标注即无属性,**完全向后兼容**;
 - Verilog 三条冗余通道:`(* pyc_tier = 1 *)` 属性、层次化命名编码、sidecar tier 指派表(主通道);三者不一致构成流程告警;
 - C++ 仿真后端忽略 tier(功能无关),可选地在 DFX 元数据中携带以便按层聚合统计。
+
+---
 
 ## 13. 附录：API 参考表
 
@@ -737,7 +965,7 @@ outs = domain.call(alu, inputs={...}, tier=1)             # 模块级缺省 tier
 |------|------|
 | `CycleAwareCircuit(name)` | 创建顶层电路 |
 | `create_domain(name, ...)` | 时钟域 |
-| `input(name, *, width, signed=False, shape=None)` | 输入端口（`shape=None` → `Wire[Bits]`；`shape=[N]` → `Wire[Vector[...]]`） |
+| `input(name, *, width, signed=False, shape=None, fields=None, enum=None)` | 输入端口（`shape=None` → `Wire[Bits]`；`shape=[N]` → `Wire[Vector[...]]`；`fields=` → `BitfieldSignal`；`enum=` → `EnumSignal`） |
 | `output(name, value)` | 输出端口 |
 | `const(value, *, width)` | 常量 |
 | `vec(*elems)` / `cat(parts)` | 容器构造 |
@@ -748,7 +976,7 @@ outs = domain.call(alu, inputs={...}, tier=1)             # 模块级缺省 tier
 
 | 方法 | 说明 |
 |------|------|
-| `signal(*, width, reset_value=0, name="")` | 前向声明寄存器（唯一方式） |
+| `signal(*, width, reset_value=0, name="", shape=None, fields=None, enum=None)` | 前向声明寄存器（唯一方式）；`fields=` → `BitfieldSignal`，`enum=` → `EnumSignal` |
 | `cycle(sig, ...)` | 单级 DFF |
 | `next()` / `prev()` | 推进 / 回退周期 |
 | `push()` / `pop()` | 周期栈 |
@@ -785,6 +1013,26 @@ outs = domain.call(alu, inputs={...}, tier=1)             # 模块级缺省 tier
 | `broadcast(*, size, dim)` | 维度广播 |
 | `priority_mux(sels, vals, *, mode="chain", default=None)` | lane 选择（`sels` 为 i1 选择器向量，最小索引优先；`default=None` 时回退到 `vals` 末元素）；模块级函数或 CAS 实例方法 |
 | `m.cat(*lanes)` / `[i]` | 拼成 packed 位向量 / 取 lane |
+
+### 类型级语法糖（`Wire` 与 CAS 通用）
+
+| 接口 | 说明 |
+|------|------|
+| `BitfieldSpec(width=, fields={name: (msb, lsb)})` | 位域布局；`(msb, lsb)` 闭区间，允许字段重叠 |
+| `spec.view(x)` / `spec(x)` | 只读视图；`f["fld"]` / `f.fld` / `f["a","b"]` |
+| `spec.update(x, fld=v)` | 读-改-写，返回同类型信号 |
+| `spec.bind(x)` / `m.input(fields=)` / `domain.signal(fields=)` | 声明即绑定 → `BitfieldSignal`（drop-in + 字段访问 + `.update()` + `.raw` / `.spec`） |
+| `spec.field_slices()` / `spec.field_width(n)` | 布局查询（名 → `(lsb, width)` / 字段宽度） |
+| `x.matches(p)` / `x.in_(ps)` / `x.not_in_(ps)` | 位掩码匹配 / 任一命中 / 均不命中（i1） |
+| `enumeration("E", "A B C")` / `class E(PycEnum)` | 类型安全枚举（0-based 编码，`E.width` 自动） |
+| `m.input(enum=E)` / `domain.signal(enum=E)` / `E.bind(x)` | 声明即绑定 → `EnumSignal` |
+| `x.is_(E.M)` / `x.is_not(E.M)` / `==` / `!=` | 成员比较（i1）；裸 int 与跨枚举报错 |
+| `E.M.const(m/domain)` / `x.raw` | 定宽常量 / 取回底层信号 |
+| `x.as_(v, …)` / `x.assert_in([...])` | 断言取值集合，原样返回 |
+| `x.as_(range=(lo,hi))` / `x.assert_range(lo,hi)` | 断言无符号区间，原样返回 |
+| `x.as_(width=w)` / `x.assert_fits(width=w)` | 受检收窄：断言高位为零 + `trunc(w)` |
+| `x.lane(i, *, width)` / `x[i, w]` | 缩放切片（ASL `x[i *: w]`） |
+| `ult / ugt / ule / uge`、`slt / sgt / sle / sge` | 显式无符号 / 有符号比较（全套） |
 
 ### compile_cycle_aware
 

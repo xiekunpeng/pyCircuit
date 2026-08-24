@@ -75,6 +75,9 @@ pyCircuit/
 │   │   ├── hw.py                  # Circuit/Wire[DT]/Reg[DT] 硬件对象模型
 │   │   ├── data.py                # Data 类型层级（Bits/Vector/Clock/Reset）
 │   │   ├── v5.py                  # CycleAware* 周期感知层（V6 主路径）
+│   │   ├── bitfield.py            # BitfieldSpec/View/Signal（单信号位域视图）
+│   │   ├── bitmask.py             # 位掩码模式解析（matches/in_ 的纯函数基座）
+│   │   ├── enums.py               # PycEnum/enumeration/EnumSignal（类型安全枚举）
 │   │   ├── design.py              # @module/@function/@const/@testbench
 │   │   ├── jit.py                 # AST JIT 追踪编译
 │   │   ├── connectors.py          # Connector/Bundle 跨模块连接
@@ -99,7 +102,7 @@ pyCircuit/
 
 ## 3. Python 前端
 
-前端分三层，自底向上：
+前端分三层（自底向上：`dsl.py` → `hw.py` → `v5.py`），另有一组纯展开期的旁挂模块（§3.3）：
 
 ### 3.1 dsl.py — MLIR 构图层
 
@@ -111,7 +114,26 @@ pyCircuit/
 - **`Wire[DT]`**：统一信号句柄，泛型参数 `DT` 绑定 `Data` 类型层级（`Bits` / `Vector` / `Clock` / `Reset`，定义在 `data.py`）。标量是 `Wire[Bits]`、向量是 `Wire[Vector[...]]`，共享全部运算符（`+ - * & \| ^ ~ == != < >` 等），逐 lane 并行、标量自动广播。向量形态额外提供归约（`reduce_or`/`reduce_and`/`reduce_sum`）、`broadcast`、`priority_mux`、`cat`、`v[i]`。禁止作 Python bool。
 - **`Reg`**：q/next/en 三元组，`set(value, when=...)` 驱动。
 
-### 3.3 v5.py — 周期感知层（V6 设计主路径）
+`Wire` 与 `CycleAwareSignal` 还共同暴露一组**类型级语法糖**（语言规范 §3.8–§3.11，与 ARM ASL 数据类型对齐）：位掩码匹配 `matches`/`in_`/`not_in_`、受检转换 `as_`/`assert_fits`/`assert_range`/`assert_in`、缩放切片 `lane(i, width=)`（下标糖 `x[i, w]`）、全套显式签名比较 `ult/ugt/ule/uge` + `slt/sgt/sle/sge`。
+
+### 3.3 类型级语法糖的三个旁挂模块
+
+`bitfield.py` / `bitmask.py` / `enums.py` 是 `hw.py`/`v5.py` 之外的**纯展开期**层，不参与 MLIR 构图，只把用户意图重写成既有 op：
+
+| 模块 | 导出 | 展开为 |
+|------|------|--------|
+| `bitfield.py` | `BitfieldSpec`（`view`/`__call__`/`update`/`bind`/`field_slices`）、`BitfieldView`（只读）、`BitfieldSignal`（drop-in 包装） | `pyc.extract` / `pyc.concat` |
+| `bitmask.py` | `parse_bitmask`（→ `(mask, value, width)`）、`parse_bitmask_checked`、`normalize_patterns` | 由调用方拼 `pyc.and` + `pyc.eq` |
+| `enums.py` | `PycEnum`（+ `_PycEnumMeta` 提供类级 `width`）、`enumeration()` 函数式构造、`EnumSignal`、`enum_width` | `pyc.constant` + `pyc.eq` |
+
+设计约束：
+
+- `bitmask.py` **零依赖**，因此 `hw.py` 与 `v5.py` 都能引用而不产生循环导入；`bitfield.py` / `enums.py` 对 `v5` 用惰性导入。
+- 包装类（`BitfieldSignal` / `EnumSignal`）通过 `__pyc_unwrap__` 钩子被 `wire_of()` / `m.output()` / `_to_wire()` 自动解包，边界处无需用户手工拆包。
+- 声明期绑定入口是 `Circuit.input(..., fields=/enum=)` 与 `CycleAwareDomain.signal(..., fields=/enum=)`；`fields=` / `enum=` / `shape=` 三者互斥，宽度冲突在展开期报错。
+- 门禁：`tests/test_bitfield_view.py`、`test_bitmask_match.py`、`test_pyc_enum.py`、`test_assert_fits.py`、`test_lane_slice.py`、`test_signed_compare.py`——核心断言是与手写 slice/cat/and-eq 的发射 MLIR **字节级等价**。
+
+### 3.4 v5.py — 周期感知层（V6 设计主路径）
 
 在 `Circuit`/`Wire` 之上实现语言规范定义的模型：
 
@@ -122,7 +144,7 @@ pyCircuit/
   - **扁平模式**：push → 执行子函数（同一张图上内联构图）→ pop；
   - **层次化模式**：把子函数以 `inputs=None` 独立编译为 `func.func` 注册进 `Design`，父模块发射 `pyc.instance`，并用记录的输出 cycle 元数据把 instance 结果重新包装为 CAS 返回。
 
-### 3.4 两条编译入口
+### 3.5 两条编译入口
 
 | 入口 | 机制 | 适用 |
 |------|------|------|
@@ -150,7 +172,7 @@ pyCircuit/
 | `pyc.mux` | 2:1 选择 |
 | `pyc.eq / ult / slt` | 比较（向量逐元素） |
 | `pyc.trunc / zext / sext` | 宽度变换 |
-| `pyc.extract` | 位切片（attr `lsb`；仅标量） |
+| `pyc.extract` | 位切片（attr `lsb`、**可选** `msb`；仅标量）。`msb` 存在时 verifier 强制 `msb == lsb + result_width - 1`，仅为可读性；无 `msb` 的旧 IR 仍合法 |
 | `pyc.shli / lshri / ashri` | 立即数移位 |
 | `pyc.shl / lshr / ashr` | 动态移位 |
 | `pyc.concat` | MSB-first 拼接 |
@@ -450,9 +472,14 @@ CMake 目标：TableGen（`PYCOps.td` → `.inc`）→ `pyc_dialect` → `pyc_tr
 ```bash
 make smoke                                    # 示例 + 仿真冒烟
 make vec-smoke                                # 向量算子回归
-PYTHONPATH=compiler/frontend pytest tests/vec -m vec     # 向量框架
-PYTHONPATH=compiler/frontend pytest tests/test_sidecar_sections.py
+pytest tests/vec -m vec                       # 向量框架
+pytest tests/test_sidecar_sections.py
+# 类型级语法糖（§3.3）的发射等价门禁
+pytest tests/test_bitfield_view.py tests/test_bitmask_match.py tests/test_pyc_enum.py \
+       tests/test_assert_fits.py tests/test_lane_slice.py tests/test_signed_compare.py
 ```
+
+> `tests/conftest.py` 已把 `compiler/frontend` 注入 `sys.path`，纯 `pytest` 调用即可，无需手工设置 `PYTHONPATH`。
 
 `tests/vec/` 是生成式测试框架：`cases.py` 定义算子用例（vv/vs/sv 形态 × add/sub/mul/logic/cmp/div/shift/reduce），`generate.py` 产出 DUT+TB，`oracle.py` 提供位精确参考模型，`runner.py` 走完整 `pycircuit build` 并可选 Verilator 对比。
 
@@ -472,6 +499,21 @@ PYTHONPATH=compiler/frontend pytest tests/test_sidecar_sections.py
 | 无动态结构 | `pyc-check-no-dynamic` | 残留 SCF / index |
 | 逻辑深度 | `pyc-check-logic-depth` | 组合路径超 `--logic-depth` |
 | 层次策略 | pycc post-check | `strict` 下模块符号集被优化改变 |
+| `msb` 一致性 | `ExtractOp::verify` | `pyc.extract` 带 `msb` 时不满足 `msb == lsb + result_width - 1` |
+
+### 展开期门禁（前端硬错误，构图阶段即失败）
+
+类型级语法糖（§3.3）的防错价值来自展开期检查，都是 Python 异常而非后端诊断：
+
+| 检查 | 抓什么 |
+|------|--------|
+| 位域布局 | `width <= 0`、字段名重复/为空、`msb < lsb`、`msb >= width`；信号宽度与 spec 不符 |
+| 位域写入 | 单次 `update` 写重叠字段（歧义）、字段值宽度不符、常量越界、写 `BitfieldView`（只读）、跨 cycle 字段写 |
+| 位掩码 | 模式位数 ≠ 信号宽度、非法字符、括号错配、空模式集合 |
+| 枚举 | 与裸 int 或跨枚举比较（`TypeError`）；显式 `width=` 与 `E.width` 冲突；成员编码为负/非 int |
+| 受检转换 | 多种约束并用、零约束、加宽、零宽、空取值集合、取值/边界越界 |
+| 缩放切片 | `width <= 0`、负索引、`idx*width+width > 信号宽度`、元组下标元数错误 |
+| 声明期绑定 | `fields=` / `enum=` / `shape=` 互斥；`fields=` 传裸字典但缺 `width=` |
 
 ### 统计与 profile
 

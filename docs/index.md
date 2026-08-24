@@ -1,4 +1,4 @@
-# Welcome to pyCircuit (pyc4.0 / pyc0.40)
+# Welcome to pyCircuit (pyc6.0 / pyc0.60)
 
 pyCircuit is a Python-based hardware construction DSL that compiles to MLIR and
 emits:
@@ -6,10 +6,10 @@ emits:
 - **C++ functional simulation** (module instances become SimObjects with `tick()` / `transfer()`)
 - **Verilog** (for RTL integration and Verilator)
 
-pyc4.0 is a hard-break release focused on **ultra-large designs**, scalable DFX,
+pyc6.0 is a hard-break release focused on **ultra-large designs**, scalable DFX,
 and strict IR legality gates.
 
-## Core ideas (pyc4.0)
+## Core ideas (pyc6.0)
 
 - `@module` is the hierarchy boundary and maps 1:1 to a simulation object.
 - Two-phase simulation: **tick** (compute / resolve) then **transfer** (commit state).
@@ -42,6 +42,8 @@ def build(m: Circuit) -> None:
 - `docs/TESTBENCH.md`
 - `docs/IR_SPEC.md`
 - **V5 cycle-aware**: `docs/PyCircuit_V5_Spec.md`
+- **V6 language spec / tutorial / architecture**: `docs/v6_PyCircuit_Specification.md`, `docs/v6_PyCircuit_Tutorial.md`, `docs/v6_PyCircuit_Software_Architecture.md`
+- **ASL-aligned type-level sugar** (bitfield views, bit-mask match, type-safe enums, checked casts): spec §3.8–§3.11, tutorial ch.9, `docs/asl_alignment_todo.md`, `docs/arm_data_type.md`
 - **Implementation workflow (10-step)**: `docs/pycircuit_implementation_method.md`
 - `docs/tutorial/index.md` (tutorial hub)
 - `designs/examples/README.md`
